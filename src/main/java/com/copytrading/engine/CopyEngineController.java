@@ -1,0 +1,185 @@
+package com.copytrading.engine;
+
+import org.springframework.http.MediaType;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
+
+import com.copytrading.config.EnginePollingProperties;
+import com.copytrading.subscription.CopySides;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/v1/engine")
+@Tag(name = "5. Copy Engine", description = "Manual copy trade, polling control, engine status")
+public class CopyEngineController {
+
+    private final CopyEngineService copyEngine;
+    private final OrderPollingService pollingService;
+    private final EngineHistoryService historyService;
+    private final EnginePollingProperties pollingProperties;
+    private final com.copytrading.config.KillSwitchCache killSwitchCache;
+
+    public CopyEngineController(CopyEngineService copyEngine, OrderPollingService pollingService,
+                                EngineHistoryService historyService,
+                                EnginePollingProperties pollingProperties,
+                                com.copytrading.config.KillSwitchCache killSwitchCache) {
+        this.copyEngine = copyEngine;
+        this.pollingService = pollingService;
+        this.historyService = historyService;
+        this.pollingProperties = pollingProperties;
+        this.killSwitchCache = killSwitchCache;
+    }
+
+    /**
+     * Manual trade copy — master triggers this to copy a trade to all active children.
+     *
+     * POST /api/v1/engine/copy-trade
+     * {
+     *   "symbol": "RELIANCE",
+     *   "qty": 10,
+     *   "side": "BUY",
+     *   "product": "MIS",
+     *   "orderType": "MARKET",
+     *   "price": 0
+     * }
+     */
+    @Operation(summary = "Copy trade to children", description = "Master triggers manual copy of a trade to all active children. Supports equity (RELIANCE) and F&O (NIFTY25JUN25000CE).")
+    @PostMapping(value = "/copy-trade", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<Map<String, Object>> copyTrade(@AuthenticationPrincipal String userId,
+                                                @RequestBody CopyTradeRequest req) {
+        return copyEngine.copyTrade(UUID.fromString(userId), req);
+    }
+
+    /**
+     * Engine status — is polling active, supported brokers, etc.
+     */
+    @GetMapping("/status")
+    public Mono<Map<String, Object>> getStatus() {
+        return copyEngine.getStatus().map(status -> {
+            boolean enabled = pollingService.isPollingEnabled();
+            status.put("pollingEnabled", enabled);
+            status.put("isPolling", enabled); // FE compat
+            status.put("pollingIntervalMs", pollingProperties.getIntervalMs());
+            status.put("pollingIntervalSeconds", pollingProperties.getIntervalSeconds());
+            status.put("kill_switch_active", killSwitchCache.isEnabled());
+            status.put("kill_switch_reason", "Platform trading has been temporarily halted by administrators.");
+            return status;
+        });
+    }
+
+    /**
+     * Enable/disable order polling.
+     *
+     * POST /api/v1/engine/polling
+     * { "enabled": true }
+     */
+    @PostMapping(value = "/polling", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<Map<String, Object>> togglePolling(@RequestBody com.copytrading.engine.dto.PollingRequest body) {
+        boolean enabled = body.isEnabled();
+        pollingService.setPollingEnabled(enabled);
+        long ms = pollingProperties.getIntervalMs();
+        String msg = enabled
+                ? "Polling started. Checking master orders every " + ms + " ms."
+                : "Polling stopped.";
+        return Mono.just(Map.of(
+                "pollingEnabled", enabled,
+                "pollingIntervalMs", ms,
+                "message", msg
+        ));
+    }
+
+    /**
+     * Reset known orders (e.g. at start of new trading day).
+     * This makes the poller treat all current orders as "new" on next poll.
+     */
+    @PostMapping("/polling/reset")
+    public Mono<Map<String, String>> resetPolling() {
+        pollingService.resetAllKnownOrders();
+        return Mono.just(Map.of("message", "Known orders cache cleared. Next poll will detect all orders as new."));
+    }
+
+    @GetMapping("/polling/status")
+    public Mono<Map<String, Object>> getPollingStatus() {
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("lastResetAt", pollingService.getLastResetAt().toString());
+        r.put("autoResetEnabled", true);
+        r.put("pollingEnabled", pollingService.isPollingEnabled());
+        r.put("pollingIntervalMs", pollingProperties.getIntervalMs());
+        return Mono.just(r);
+    }
+
+    /** FE metadata: skip reasons, copy sides, notification types. */
+    @GetMapping("/trade-history")
+    public Mono<Map<String, Object>> tradeHistory(@AuthenticationPrincipal String userId,
+                                                    @RequestParam(defaultValue = "0") int page,
+                                                    @RequestParam(defaultValue = "20") int size,
+                                                    @RequestParam(required = false) String from,
+                                                    @RequestParam(required = false) String to,
+                                                    @RequestParam(required = false) String symbol,
+                                                    @RequestParam(required = false) String side) {
+        return historyService.getTradeHistory(UUID.fromString(userId), page, size, from, to, symbol, side);
+    }
+
+    @GetMapping("/trade-history/{eventId}")
+    public Mono<Map<String, Object>> tradeHistoryDetail(@AuthenticationPrincipal String userId,
+                                                         @PathVariable String eventId) {
+        return historyService.getTradeEventDetail(UUID.fromString(userId), eventId);
+    }
+
+    @GetMapping("/latency-stats")
+    public Mono<Map<String, Object>> latencyStats(@AuthenticationPrincipal String userId,
+                                                   @RequestParam(defaultValue = "7") int days) {
+        return historyService.getLatencyStats(UUID.fromString(userId), days);
+    }
+
+    @GetMapping("/config")
+    public Mono<Map<String, Object>> engineConfig() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        long pollMs = pollingProperties.getIntervalMs();
+        String pollLabel = "polling_" + pollMs + "ms";
+        m.put("detectionMethods", Map.of(
+                "ZERODHA", "postback",
+                "FYERS", pollLabel,
+                "UPSTOX", pollLabel,
+                "DHAN", pollLabel,
+                "GROWW", pollLabel,
+                "ANGELONE", pollLabel
+        ));
+        m.put("serverRegion", System.getenv().getOrDefault("AWS_REGION", "eu-north-1"));
+        m.put("connectionPooling", true);
+        m.put("inMemoryCacheEnabled", true);
+        m.put("sessionCacheTTL", 300);
+        m.put("pollingIntervalMs", pollMs);
+        return Mono.just(m);
+    }
+
+    @GetMapping("/metadata")
+    public Mono<Map<String, Object>> getMetadata() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("copySidesOptions", List.of(
+                Map.of("id", CopySides.BUY_ONLY, "label", "Buy only (safe default)",
+                        "description", "Copy BUY; SELL only with copied BUY + live position"),
+                Map.of("id", CopySides.BUY_AND_SELL, "label", "Buy and sell",
+                        "description", "Copy BUY and SELL when child has live long qty"),
+                Map.of("id", CopySides.MIRROR, "label", "Mirror master",
+                        "description", "Copy all sides; optional naked short if allowShortSelling")
+        ));
+        m.put("skipReasons", List.of(
+                "ZERO_QUANTITY", "SUB_LOT_SIZE", "RISK_LIMIT", "MAX_CAPITAL_EXPOSURE",
+                "NO_POSITION", "INSUFFICIENT_POSITION", "SELL_BLOCKED", "MARKET_CLOSED",
+                "SESSION_EXPIRED"
+        ));
+        m.put("notificationTypes", List.of(
+                "TRADE_COPIED", "TRADE_FAILED", "MARKET_CLOSED", "SESSION_EXPIRED",
+                "SESSION_EXPIRING", "SESSION_REMINDER", "BROKER_DISCONNECTED", "BROKER_RECONNECT_REQUIRED"
+        ));
+        return Mono.just(m);
+    }
+}

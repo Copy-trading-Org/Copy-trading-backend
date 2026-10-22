@@ -1,0 +1,217 @@
+package com.copytrading.config;
+
+import io.r2dbc.spi.ConnectionFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.r2dbc.core.DatabaseClient;
+
+@Configuration
+public class SchemaInitializer {
+
+    private static final Logger log = LoggerFactory.getLogger(SchemaInitializer.class);
+
+    @Bean
+    public ApplicationRunner initSchema(ConnectionFactory cf) {
+        return args -> {
+            DatabaseClient db = DatabaseClient.create(cf);
+
+            String[] statements = {
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  name          VARCHAR(200) NOT NULL,
+                  email         VARCHAR(255) UNIQUE NOT NULL,
+                  password_hash TEXT NOT NULL,
+                  role          VARCHAR(20) NOT NULL CHECK (role IN ('ADMIN','MASTER','CHILD')),
+                  status        VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','INACTIVE')),
+                  phone         VARCHAR(30),
+                  two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                  two_factor_secret  TEXT,
+                  telegram_chat_id   VARCHAR(100),
+                  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS broker_accounts (
+                  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  broker_id       VARCHAR(50) NOT NULL,
+                  client_id       VARCHAR(100) NOT NULL,
+                  api_key         TEXT,
+                  api_secret      TEXT,
+                  access_token    TEXT,
+                  nickname        VARCHAR(100),
+                  status          VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                  session_active  BOOLEAN NOT NULL DEFAULT FALSE,
+                  session_expires TIMESTAMPTZ,
+                  linked_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                  id                BIGSERIAL PRIMARY KEY,
+                  master_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  child_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  broker_account_id UUID NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
+                  scaling_factor    DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                  copying_status    VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                  approved_once     BOOLEAN NOT NULL DEFAULT FALSE,
+                  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS copy_logs (
+                  id               BIGSERIAL PRIMARY KEY,
+                  master_id        UUID,
+                  child_id         UUID,
+                  master_trade_id  VARCHAR(100),
+                  symbol           VARCHAR(50),
+                  qty              INTEGER,
+                  trade_type       VARCHAR(10),
+                  master_status    VARCHAR(30),
+                  child_status     VARCHAR(30),
+                  error_message    TEXT,
+                  skip_reason      VARCHAR(50),
+                  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS notifications (
+                  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  user_id    UUID NOT NULL,
+                  type       VARCHAR(50) NOT NULL,
+                  title      VARCHAR(200) NOT NULL,
+                  message    TEXT,
+                  read       BOOLEAN NOT NULL DEFAULT FALSE,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS master_active_accounts (
+                  master_id        UUID NOT NULL,
+                  broker_account_id UUID PRIMARY KEY,
+                  activated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  user_id          UUID NOT NULL,
+                  broker_account_id UUID NOT NULL,
+                  broker_order_id  VARCHAR(100),
+                  instrument       VARCHAR(100) NOT NULL,
+                  exchange         VARCHAR(10) NOT NULL DEFAULT 'NSE',
+                  segment          VARCHAR(10) NOT NULL DEFAULT 'EQUITY',
+                  order_type       VARCHAR(20) NOT NULL DEFAULT 'MARKET',
+                  transaction_type VARCHAR(10) NOT NULL,
+                  quantity         INTEGER NOT NULL,
+                  price            DOUBLE PRECISION NOT NULL DEFAULT 0,
+                  trigger_price    DOUBLE PRECISION,
+                  product          VARCHAR(10) NOT NULL DEFAULT 'MIS',
+                  validity         VARCHAR(10) DEFAULT 'DAY',
+                  status           VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                  replications_triggered INTEGER DEFAULT 0,
+                  placed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  executed_at      TIMESTAMPTZ,
+                  cancelled_at     TIMESTAMPTZ
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS risk_rules (
+                  user_id               UUID PRIMARY KEY,
+                  max_trades_per_day    INTEGER NOT NULL DEFAULT 50,
+                  max_open_positions    INTEGER NOT NULL DEFAULT 20,
+                  max_capital_exposure  DOUBLE PRECISION NOT NULL DEFAULT 80,
+                  margin_check_enabled  BOOLEAN NOT NULL DEFAULT TRUE,
+                  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS broker_error_logs (
+                  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  user_id           UUID NOT NULL,
+                  broker_account_id UUID,
+                  broker_name       VARCHAR(30),
+                  error_code        VARCHAR(50),
+                  error_message     TEXT,
+                  trade_id          UUID,
+                  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS system_settings (
+                  key   VARCHAR(255) PRIMARY KEY,
+                  value TEXT NOT NULL
+                )
+                """,
+                "INSERT INTO system_settings (key, value) VALUES ('kill_switch', 'false') ON CONFLICT DO NOTHING",
+                """
+                CREATE TABLE IF NOT EXISTS admin_audit_logs (
+                  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  action     VARCHAR(100) NOT NULL,
+                  parameters TEXT,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """,
+                // Add skip_reason column to existing copy_logs tables
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS skip_reason VARCHAR(50)",
+                // Add latency_ms column to copy_logs
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS latency_ms BIGINT",
+                // Add timing and grouping columns to copy_logs
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS copy_group_id VARCHAR(36)",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS master_placed_at TIMESTAMPTZ",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS engine_received_at TIMESTAMPTZ",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS child_placed_at TIMESTAMPTZ",
+                // Child scaled qty (distinct from master qty) and child's broker order id for tracking/cancel/reconcile
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS child_qty INTEGER",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS child_broker_order_id VARCHAR(100)",
+                // Add telegram_chat_id to users
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id VARCHAR(100)",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_channel VARCHAR(10)",
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS copy_sides VARCHAR(20) DEFAULT 'BUY_ONLY'",
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS allow_short_selling BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE risk_rules ADD COLUMN IF NOT EXISTS copy_paused BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE risk_rules ADD COLUMN IF NOT EXISTS paused_until TIMESTAMPTZ",
+                // IP slot for Groww per-user IP routing (0 = primary IP, 1+ = proxy slots)
+                "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS ip_slot INTEGER NOT NULL DEFAULT 0",
+                // Add product, order_type, price, trigger_price to copy_logs for order detail tracking
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS product VARCHAR(10)",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS order_type VARCHAR(20)",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS trigger_price DOUBLE PRECISION",
+                // Price tolerance per child subscription (default 2%)
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS price_tolerance_pct DOUBLE PRECISION NOT NULL DEFAULT 2.0",
+                // Per-user proxy support: route broker API calls through user's own proxy
+                "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_host VARCHAR(255)",
+                "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_port INTEGER",
+                "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_user VARCHAR(255)",
+                "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS proxy_pass TEXT",
+                // Google OAuth
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT",
+                // Exchange order ID for reconciliation
+                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(100)",
+                "ALTER TABLE copy_logs ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(100)",
+                // TOTP secret per broker account (encrypted, for auto-TOTP generation)
+                "ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS totp_secret TEXT",
+                // Multiple active broker accounts for Master (migrate PK to broker_account_id)
+                "ALTER TABLE master_active_accounts DROP CONSTRAINT IF EXISTS master_active_accounts_pkey CASCADE",
+                "ALTER TABLE master_active_accounts ADD PRIMARY KEY (broker_account_id)"
+            };
+
+            reactor.core.publisher.Flux.fromArray(statements)
+                .concatMap(sql -> db.sql(sql).then()
+                    .doOnSuccess(v -> log.info("Schema check OK: {}", sql.trim().substring(0, Math.min(60, sql.trim().length()))))
+                    .doOnError(e -> log.warn("Schema init warning: {}", e.getMessage()))
+                    .onErrorResume(e -> reactor.core.publisher.Mono.empty())
+                )
+                .then()
+                .block();
+        };
+    }
+}
